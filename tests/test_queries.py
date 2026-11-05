@@ -245,5 +245,191 @@ class TestHelper(unittest.TestCase):
             c.execute("INSERT INTO message (ROWID) VALUES (99)")
         c.close()
 
+
+# ---------------------------------------------------------------------------
+# Integration tests: compile Sources/main.swift and run it against fake data.
+# All numbers are +1555 fakes and all names are made up.
+# ---------------------------------------------------------------------------
+import shutil
+import subprocess
+
+REPO = Path(__file__).resolve().parent.parent
+AB_SCHEMA = """
+CREATE TABLE ZABCDRECORD (Z_PK INTEGER PRIMARY KEY, ZFIRSTNAME TEXT, ZLASTNAME TEXT, ZORGANIZATION TEXT, ZNICKNAME TEXT);
+CREATE TABLE ZABCDPHONENUMBER (Z_PK INTEGER PRIMARY KEY, ZOWNER INTEGER, ZFULLNUMBER TEXT);
+CREATE TABLE ZABCDEMAILADDRESS (Z_PK INTEGER PRIMARY KEY, ZOWNER INTEGER, ZADDRESS TEXT);
+"""
+
+def make_addressbook(path, records):
+    """records: list of (first, last, org, nick, [phones], [emails])"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    c = sqlite3.connect(path)
+    c.executescript(AB_SCHEMA)
+    for pk, (f, l, o, n, phones, emails) in enumerate(records, start=1):
+        c.execute("INSERT INTO ZABCDRECORD VALUES (?,?,?,?,?)", (pk, f, l, o, n))
+        for ph in phones:
+            c.execute("INSERT INTO ZABCDPHONENUMBER (ZOWNER, ZFULLNUMBER) VALUES (?,?)", (pk, ph))
+        for em in emails:
+            c.execute("INSERT INTO ZABCDEMAILADDRESS (ZOWNER, ZADDRESS) VALUES (?,?)", (pk, em))
+    c.commit()
+    c.close()
+
+@unittest.skipUnless(shutil.which("swiftc"), "swiftc not available")
+class TestSwiftBinary(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.work = tempfile.mkdtemp(prefix="imsg-test-")
+        cls.bin = os.path.join(cls.work, "imsg-helper")
+        subprocess.run(["swiftc", "-O", "-o", cls.bin, str(REPO / "Sources/main.swift")], check=True)
+        # Fake chat.db
+        cls.chat = os.path.join(cls.work, "chat.db")
+        db = sqlite3.connect(cls.chat)
+        db.executescript(SCHEMA)
+        handles = ["+15551110001", "friend@example.com", "+15551110002", "+15551110003", "+15551110004"]
+        for i, h in enumerate(handles, start=1):
+            db.execute("INSERT INTO handle VALUES (?,?, 'iMessage')", (i, h))
+        chats = [(1, "+15551110001", ""), (2, "chat123group", "Family Group"), (3, "+15551110002", ""),
+                 (4, "+15551110003", ""), (5, "+15551110004", "")]
+        for cid, ident, name in chats:
+            db.execute("INSERT INTO chat VALUES (?,?,?, 'iMessage')", (cid, ident, name))
+        for cid, hid in [(1, 1), (2, 1), (2, 2), (3, 3), (4, 4), (5, 5)]:
+            db.execute("INSERT INTO chat_handle_join VALUES (?,?)", (cid, hid))
+        now = apple_ns_now(-1)
+        msgs = [  # (rowid, chat, handle, text, from_me)
+            (1, 1, 1, "alpha one-on-one", 0),
+            (2, 1, 1, "alpha reply", 1),
+            (3, 2, 1, "group from alpha", 0),
+            (4, 2, 2, "group from friend zebra", 0),
+            (5, 3, 3, "unknown sender zebra", 0),
+            (6, 4, 4, "sam one", 0),
+            (7, 5, 5, "sam two", 0),
+        ]
+        for rid, cid, hid, text, me in msgs:
+            db.execute("INSERT INTO message VALUES (?,?,?,NULL,?,?,?, 'iMessage')",
+                       (rid, f"g{rid}", text, hid, now + rid * 1000, me))
+            db.execute("INSERT INTO chat_message_join VALUES (?,?)", (cid, rid))
+        db.commit()
+        db.close()
+        # Fake Contacts: main DB + one synced source with a duplicate record
+        cls.ab = os.path.join(cls.work, "AddressBook")
+        make_addressbook(os.path.join(cls.ab, "AddressBook-v22.abcddb"), [
+            ("Alex", "Fake", "", "", ["(555) 111-0001"], []),
+            ("Pat", "Example", "", "", [], ["FRIEND@Example.com"]),
+            ("Sam", "Test", "", "", ["555.111.0003"], []),
+            ("Sam", "Test", "", "", ["+1 555 111 0004"], []),
+        ])
+        make_addressbook(os.path.join(cls.ab, "Sources", "FAKE-SOURCE", "AddressBook-v22.abcddb"), [
+            ("Alex", "Fake", "", "Al", ["+15551110001"], []),
+        ])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.work, ignore_errors=True)
+
+    def run_bin(self, *args, blocklist="", contacts=None):
+        bl = os.path.join(self.work, "blocked.txt")
+        with open(bl, "w") as f:
+            f.write("# comment line\n" + blocklist)
+        cmd = [self.bin, *args, "--db", self.chat, "--contacts-root", contacts or self.ab, "--blocklist", bl]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        return json.loads(p.stdout), p.stdout
+
+    def all_msgs(self, out):
+        if "threads" in out:
+            return [m for t in out["threads"] for m in t["messages"]]
+        return out.get("messages", [])
+
+    def test_names_resolved(self):
+        out, _ = self.run_bin("recent", "--hours", "6")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["blocked_count"], 0)
+        self.assertNotIn("warning", out)
+        by_text = {m["text"]: m for m in self.all_msgs(out)}
+        self.assertEqual(by_text["alpha one-on-one"]["sender_name"], "Alex Fake")
+        self.assertEqual(by_text["alpha one-on-one"]["chat_contact_name"], "Alex Fake")
+        self.assertIsNone(by_text["alpha reply"]["sender_name"])  # from me
+        self.assertEqual(by_text["group from friend zebra"]["sender_name"], "Pat Example")  # email, case-insensitive
+        self.assertIsNone(by_text["group from friend zebra"]["chat_contact_name"])  # group chat
+        self.assertIsNone(by_text["unknown sender zebra"]["sender_name"])
+        t = {t["chat_identifier"]: t for t in out["threads"]}
+        self.assertEqual(t["+15551110001"]["chat_contact_name"], "Alex Fake")
+        self.assertIsNone(t["+15551110002"]["chat_contact_name"])
+
+    def test_thread_by_contact_name(self):
+        for q in ["Alex Fake", "alex fake", "Al", "Alex"]:
+            out, _ = self.run_bin("thread", "--handle", q, "--days", "2")
+            self.assertTrue(out["ok"], q)
+            self.assertEqual(out["resolved_handles"], ["+15551110001"])
+            texts = {m["text"] for m in out["messages"]}
+            self.assertTrue({"alpha one-on-one", "alpha reply", "group from alpha"} <= texts, q)
+
+    def test_thread_by_formatted_phone(self):
+        out, _ = self.run_bin("thread", "--handle", "(555) 111-0001", "--days", "2")
+        self.assertTrue(out["ok"])
+        self.assertIn("alpha one-on-one", {m["text"] for m in out["messages"]})
+
+    def test_thread_ambiguous_name(self):
+        out, raw = self.run_bin("thread", "--handle", "Sam Test", "--days", "2")
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["ambiguous"])
+        handles = sorted(h for c in out["candidates"] for h in c["handles"])
+        self.assertEqual(handles, ["+15551110003", "+15551110004"])
+        self.assertNotIn("sam one", raw)
+
+    def test_contacts_unreadable_warns(self):
+        out, _ = self.run_bin("recent", "--hours", "6", contacts=os.path.join(self.work, "missing"))
+        self.assertTrue(out["ok"])
+        self.assertIn("contacts unavailable", out["warning"])
+        self.assertTrue(all(m["sender_name"] is None for m in self.all_msgs(out)))
+
+    def test_block_phone_any_format(self):
+        out, raw = self.run_bin("recent", "--hours", "6", blocklist="(555) 111-0002\n")
+        self.assertEqual(out["blocked_count"], 1)
+        self.assertNotIn("+15551110002", raw)
+        self.assertNotIn("unknown sender", raw)
+        out, raw = self.run_bin("search", "--query", "zebra", "--days", "2", blocklist="555-111-0002\n")
+        self.assertEqual([m["text"] for m in out["messages"]], ["group from friend zebra"])
+        self.assertNotIn("unknown sender", raw)
+        out, raw = self.run_bin("thread", "--handle", "+15551110002", "--days", "2", blocklist="5551110002\n")
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["blocked"])
+        self.assertNotIn("messages", out)
+        self.assertNotIn("unknown sender", raw)
+
+    def test_block_group_name_and_identifier(self):
+        for entry in ["family group", "chat123group"]:
+            out, raw = self.run_bin("recent", "--hours", "6", blocklist=entry + "\n")
+            self.assertNotIn("group from", raw, entry)
+            self.assertEqual(out["blocked_count"], 2, entry)
+            for q in ["Family Group", "chat123group"]:
+                out, raw = self.run_bin("thread", "--handle", q, "--days", "2", blocklist=entry + "\n")
+                self.assertFalse(out["ok"], (entry, q))
+                self.assertNotIn("group from", raw)
+
+    def test_block_contact_name_and_email(self):
+        for entry in ["Pat Example", "friend@EXAMPLE.com"]:
+            out, raw = self.run_bin("recent", "--hours", "6", blocklist=entry + "\n")
+            self.assertNotIn("friend", raw.replace("Family Group", ""), entry)
+            self.assertIn("group from alpha", raw)  # rest of the group survives
+            self.assertEqual(out["blocked_count"], 1)
+        out, raw = self.run_bin("thread", "--handle", "Alex Fake", "--days", "2", blocklist="Alex Fake\n")
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["blocked"])
+        self.assertNotIn("alpha", raw)
+        out, raw = self.run_bin("thread", "--handle", "+15551110001", "--days", "2", blocklist="Alex Fake\n")
+        self.assertFalse(out["ok"])
+        self.assertNotIn("alpha", raw)
+
+    def test_blocklist_command(self):
+        out, raw = self.run_bin("blocklist", blocklist="# another comment\n\n+15551110002\nFamily Group\n")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["entries"], 2)
+        self.assertNotIn("Family Group", raw)  # entries themselves are never echoed
+
+    def test_overrides_need_test_db(self):
+        p = subprocess.run([self.bin, "recent", "--blocklist", "/dev/null"], capture_output=True, text=True)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("only allowed with --db", p.stdout)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

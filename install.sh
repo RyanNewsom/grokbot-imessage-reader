@@ -82,6 +82,25 @@ cat > "${PLIST_DST}" << PLIST
 </plist>
 PLIST
 
+# Blocklist: created empty if missing, never overwritten. Only the user edits it.
+BLOCKLIST="${SUPPORT}/blocked.txt"
+if [[ ! -e "${BLOCKLIST}" ]]; then
+  cat > "${BLOCKLIST}" << 'TXT'
+# imsg-helper blocklist. The helper drops every message from these chats/senders
+# before output (recent, search, thread). Edit this file yourself; bots must not.
+# One entry per line. Lines starting with # are comments. Entries can be:
+#   a phone number in any format (matched on its last 10 digits), e.g. +1 555 010 0000
+#   an email address (case-insensitive)
+#   a chat_identifier, e.g. chat123456789
+#   a group chat name, exactly as shown in Messages
+#   a contact's full name, nickname, or company, exactly as saved in Contacts
+TXT
+  chmod 644 "${BLOCKLIST}"
+  echo "Created empty blocklist: ${BLOCKLIST}"
+else
+  echo "Keeping existing blocklist: ${BLOCKLIST}"
+fi
+
 # Wrapper CLI
 install -m 755 "${SCRIPT_DIR}/imsg-read" "${HOME}/.local/bin/imsg-read"
 # Also keep a copy next to the app for the README path
@@ -106,4 +125,7 @@ echo "If you rebuild later, remove the old entry and add the app again (ad-hoc s
 echo ""
 echo "Test:"
 echo "  ~/.local/bin/imsg-read recent --hours 24"
+echo ""
+echo "Contact names come from your local Contacts database (read-only, same FDA grant)."
+echo "To hide chats from bots, edit: ${BLOCKLIST}"
 echo ""

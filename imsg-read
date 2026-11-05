@@ -13,7 +13,8 @@ UID_NUM="$(id -u)"
 usage() {
   echo "Usage: imsg-read recent --hours N [--limit N]" >&2
   echo "       imsg-read search --query TEXT --days N [--limit N]" >&2
-  echo "       imsg-read thread --handle PHONE_OR_EMAIL_OR_NAME --days N [--limit N]" >&2
+  echo "       imsg-read thread --handle PHONE_EMAIL_CHAT_OR_CONTACT_NAME --days N [--limit N]" >&2
+  echo "       imsg-read blocklist   (shows the blocklist path and entry count; edit the file yourself)" >&2
   exit 2
 }
 
@@ -49,6 +50,9 @@ case "$CMD" in
     [[ -n "$HANDLE" ]] || usage
     python3 -c "import json,sys; json.dump({'command':'thread','handle':sys.argv[1],'days':int(sys.argv[2]),'limit':int(sys.argv[3])}, open(sys.argv[4],'w'))" \
       "$HANDLE" "$DAYS" "$LIMIT" "$REQ"
+    ;;
+  blocklist)
+    python3 -c "import json,sys; json.dump({'command':'blocklist'}, open(sys.argv[1],'w'))" "$REQ"
     ;;
   *) usage ;;
 esac
