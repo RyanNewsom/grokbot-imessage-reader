@@ -1,0 +1,88 @@
+#!/bin/bash
+# Unprivileged trigger: write request.json, kickstart LaunchAgent, print response.json.
+# This is what Grok Bot should run on your Mac (after you approve the shell command).
+set -euo pipefail
+
+LABEL="com.local.imessage-helper"
+SUPPORT="${HOME}/Library/Application Support/imessage-helper"
+REQ="${SUPPORT}/request.json"
+RES="${SUPPORT}/response.json"
+TIMEOUT="${IMSG_TIMEOUT:-15}"
+UID_NUM="$(id -u)"
+
+usage() {
+  echo "Usage: imsg-read recent --hours N [--limit N]" >&2
+  echo "       imsg-read search --query TEXT --days N [--limit N]" >&2
+  echo "       imsg-read thread --handle PHONE_OR_EMAIL_OR_NAME --days N [--limit N]" >&2
+  exit 2
+}
+
+[[ $# -ge 1 ]] || usage
+CMD="$1"; shift
+
+HOURS=24; DAYS=30; LIMIT=200; QUERY=""; HANDLE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --hours) HOURS="${2:-}"; shift 2 ;;
+    --days) DAYS="${2:-}"; shift 2 ;;
+    --limit) LIMIT="${2:-}"; shift 2 ;;
+    --query) QUERY="${2:-}"; shift 2 ;;
+    --handle) HANDLE="${2:-}"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+
+mkdir -p "${SUPPORT}"
+rm -f "${RES}"
+
+case "$CMD" in
+  recent)
+    python3 -c "import json,sys; json.dump({'command':'recent','hours':int(sys.argv[1]),'limit':int(sys.argv[2])}, open(sys.argv[3],'w'))" \
+      "$HOURS" "$LIMIT" "$REQ"
+    ;;
+  search)
+    [[ -n "$QUERY" ]] || usage
+    python3 -c "import json,sys; json.dump({'command':'search','query':sys.argv[1],'days':int(sys.argv[2]),'limit':int(sys.argv[3])}, open(sys.argv[4],'w'))" \
+      "$QUERY" "$DAYS" "$LIMIT" "$REQ"
+    ;;
+  thread)
+    [[ -n "$HANDLE" ]] || usage
+    python3 -c "import json,sys; json.dump({'command':'thread','handle':sys.argv[1],'days':int(sys.argv[2]),'limit':int(sys.argv[3])}, open(sys.argv[4],'w'))" \
+      "$HANDLE" "$DAYS" "$LIMIT" "$REQ"
+    ;;
+  *) usage ;;
+esac
+chmod 600 "$REQ" 2>/dev/null || true
+
+# Kick the on-demand LaunchAgent (binary is responsible process → FDA applies to it, not Terminal)
+if ! launchctl kickstart "gui/${UID_NUM}/${LABEL}" 2>/dev/null; then
+  # Agent may not be bootstrapped yet
+  PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+  if [[ -f "$PLIST" ]]; then
+    launchctl bootstrap "gui/${UID_NUM}" "$PLIST" 2>/dev/null || true
+    launchctl kickstart "gui/${UID_NUM}/${LABEL}" || {
+      echo "{\"ok\":false,\"error\":\"launchctl kickstart failed; is the LaunchAgent installed?\"}" >&2
+      exit 1
+    }
+  else
+    echo "{\"ok\":false,\"error\":\"LaunchAgent not installed; run install.sh first\"}" >&2
+    exit 1
+  fi
+fi
+
+# Wait for response
+deadline=$((SECONDS + TIMEOUT))
+while [[ ! -f "$RES" ]]; do
+  if (( SECONDS >= deadline )); then
+    err=""
+    [[ -f "${SUPPORT}/agent.err.log" ]] && err="$(tail -c 500 "${SUPPORT}/agent.err.log" 2>/dev/null || true)"
+    echo "{\"ok\":false,\"error\":\"timeout waiting for response (${TIMEOUT}s). Check Full Disk Access. ${err}\"}" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+# Small settle for atomic write
+sleep 0.05
+cat "$RES"
+echo
