@@ -10,9 +10,13 @@ A small, read-only tool that lets Grok Bot (or you) read your Mac’s iMessage h
 
 ## What it cannot do
 
-- Send, delete, or edit messages
+- Send, delete, or edit messages (this helper only reads)
 - Talk to the network
 - Run in the background (it only runs when you or Grok Bot call `imsg-read`)
+
+## What about sending?
+
+This helper never sends. Grok Bot *can* still send a text on your Mac by a separate route: an AppleScript command (`osascript`) that tells the Messages app to send. That route needs no Full Disk Access, only the macOS **Automation → Messages** permission, which macOS asks you to allow the first time. It is not part of this repo. A bot should send only after showing you the exact recipient and text and getting your explicit yes. To turn sending off, revoke Messages under System Settings → Privacy & Security → Automation.
 
 Message text it returns can be pasted into the Grok Bot chat. Treat that like sharing those texts with the bot.
 

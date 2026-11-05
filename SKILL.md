@@ -22,4 +22,4 @@ Each message has `date`, `text`, `is_from_me`, `sender`, `chat_name`, `chat_iden
 - Read only what the user asked for; summarize instead of dumping whole threads.
 - Threads show phone numbers, not contact names. Resolve names with the user's contacts, and never guess who a number belongs to.
 - Never invent a message, number, or thread the helper did not return.
-- This tool never sends. If the user wants to reply, show the exact draft and recipient and send only after their explicit yes, through a separate method they approve.
+- This tool never sends. Sending is a separate route: `osascript` telling the Messages app to send, which needs the user's Automation → Messages permission. Use it only after showing the exact recipient and full text and getting the user's explicit yes for that message.
